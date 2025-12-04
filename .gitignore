@@ -1,0 +1,43 @@
+# Green's Function stores
+gf_stores/
+gf_sc3gf1d/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+
+# QSEIS working directories
+raw/
+qseis_*/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Test outputs
+test_*
+debug_*
