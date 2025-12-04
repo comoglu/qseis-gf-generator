@@ -333,7 +333,7 @@ def create_config_template(filename='gf_config_template.yaml'):
             'max': 50.0,
             'delta': 1.0
         },
-        'duration': 300.0,
+        'duration': 600.0,
         'modelling_code': 'qseis.2006a',
         'qseis': {
             'sw_algorithm': 1,
