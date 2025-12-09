@@ -260,7 +260,7 @@ fomosto check
 
 - **Pyrocko/Fomosto**: https://pyrocko.org/
 - **QSEIS**: Wang, R. (2006) - Reflectivity method for computing synthetic seismograms
-- **SeisComP**: https://www.seiscomp.org/
+- **SeisComP**: https://www.seiscomp.de/
 - **sc3gf1d format**: SeisComP Green's function format specification
 
 ## License

@@ -63,7 +63,6 @@ def load_velocity_model(model_spec):
         print(f"Loading built-in Pyrocko model: {model_spec}")
         try:
             # Get the actual model file from Pyrocko's data directory
-            from pyrocko import config as pconfig
             model_file = builtin_models[model_spec]
             # Try to load using Pyrocko's builtin function
             try:
@@ -333,12 +332,15 @@ def create_config_template(filename='gf_config_template.yaml'):
             'max': 50.0,
             'delta': 1.0
         },
-        'duration': 600.0,
+        'duration': 'auto',  # or specify in seconds (e.g., 1200.0)
+        'time_start': -50.0,  # seconds before origin time
         'modelling_code': 'qseis.2006a',
         'qseis': {
-            'sw_algorithm': 1,
+            'sw_algorithm': 0,  # 0 = full wavefield (recommended)
             'sw_flat_earth_transform': 1,
-            'slowness_window': [0.0, 0.0, 0.5, 1.5]
+            'slowness_window': [0.0, 0.0, 0.0, 0.0],  # full spectrum
+            'sample_rate': 8.0,  # wavenumber integration sampling
+            'supp_factor': 0.05  # anti-aliasing suppression
         }
     }
 
@@ -348,6 +350,99 @@ def create_config_template(filename='gf_config_template.yaml'):
     print(f"Configuration template created: {filename}")
     print("\nEdit this file and run:")
     print(f"  python3 generate_gf_custom.py --config {filename}")
+
+
+def calculate_optimal_duration(dist_max_km, depth_max_km, min_velocity_km_s=2.5):
+    """
+    Calculate optimal time window duration based on distance range.
+
+    Parameters:
+    -----------
+    dist_max_km : float
+        Maximum distance in km
+    depth_max_km : float
+        Maximum source depth in km
+    min_velocity_km_s : float
+        Minimum expected velocity (default 2.5 km/s for surface waves)
+
+    Returns:
+    --------
+    float : Recommended duration in seconds
+    """
+    # Time for slowest surface waves to arrive
+    surface_wave_time = dist_max_km / min_velocity_km_s
+
+    # Add time for multiple reflections and converted phases
+    # Rule of thumb: 1.5x the direct arrival time + depth contribution
+    reflection_factor = 1.5
+    depth_contribution = depth_max_km / 6.0  # ~6 km/s average crustal velocity
+
+    # Total duration with safety margin
+    duration = surface_wave_time * reflection_factor + depth_contribution + 100.0
+
+    # Round up to nearest 100 seconds for cleaner numbers
+    duration = ((int(duration) // 100) + 1) * 100
+
+    # Minimum duration: 300s, Maximum practical: 3600s
+    duration = max(300.0, min(duration, 3600.0))
+
+    return duration
+
+
+def validate_configuration(config):
+    """
+    Validate configuration parameters for robustness.
+
+    Returns warnings and errors as list of strings.
+    """
+    warnings = []
+    errors = []
+
+    dist_min = config['distance']['min']
+    dist_max = config['distance']['max']
+    dist_delta = config['distance']['delta']
+    depth_min = config['depth']['min']
+    depth_max = config['depth']['max']
+    sample_rate = config['sample_rate']
+
+    # Distance validations
+    if dist_min < 1.0:
+        warnings.append(f"⚠ Distance minimum ({dist_min} km) < 1 km may cause near-field issues")
+
+    if dist_min < 10.0:
+        warnings.append(f"⚠ Distance minimum ({dist_min} km) < 10 km: near-field approximations may be inaccurate")
+
+    if dist_max > 10000.0:
+        warnings.append(f"⚠ Distance maximum ({dist_max} km) > 10000 km: consider global wave propagation effects")
+
+    # Check distance sampling vs wavelength
+    min_wavelength_km = 2.5 / sample_rate  # Slowest waves at Nyquist
+    if dist_delta > min_wavelength_km / 2:
+        warnings.append(f"⚠ Distance delta ({dist_delta} km) may undersample wavelengths (min λ ≈ {min_wavelength_km:.1f} km)")
+
+    # Depth validations
+    if depth_min < 0.1:
+        warnings.append(f"⚠ Depth minimum ({depth_min} km) < 0.1 km may cause numerical instabilities")
+
+    if depth_max > 200.0:
+        warnings.append(f"⚠ Depth maximum ({depth_max} km) > 200 km: ensure velocity model extends to this depth")
+
+    # Sample rate validations
+    if sample_rate < 1.0:
+        warnings.append(f"⚠ Sample rate ({sample_rate} Hz) < 1 Hz: very low frequency only")
+
+    if sample_rate > 20.0:
+        warnings.append(f"⚠ Sample rate ({sample_rate} Hz) > 20 Hz: high storage requirements and computation time")
+
+    # Duration validation
+    duration = config.get('duration', 'auto')
+    if duration != 'auto':
+        optimal_duration = calculate_optimal_duration(dist_max, depth_max)
+        if duration < optimal_duration * 0.7:
+            warnings.append(f"⚠ Duration ({duration}s) may be too short for {dist_max} km distance")
+            warnings.append(f"  Recommended: {optimal_duration}s or use 'auto'")
+
+    return warnings, errors
 
 
 def create_gf_store_from_config(config, base_dir='gf_stores'):
@@ -366,6 +461,21 @@ def create_gf_store_from_config(config, base_dir='gf_stores'):
     print(f"Creating Green's Function Store: {store_name}")
     print("=" * 70)
 
+    # Validate configuration
+    warnings, errors = validate_configuration(config)
+
+    if errors:
+        print("\n❌ CONFIGURATION ERRORS:")
+        for error in errors:
+            print(f"  {error}")
+        return None
+
+    if warnings:
+        print("\n⚠️  CONFIGURATION WARNINGS:")
+        for warning in warnings:
+            print(f"  {warning}")
+        print()
+
     # Load earth model
     earth_model = load_velocity_model(config['earth_model'])
 
@@ -377,7 +487,19 @@ def create_gf_store_from_config(config, base_dir='gf_stores'):
     depth_min = config['depth']['min'] * 1000.
     depth_max = config['depth']['max'] * 1000.
     depth_delta = config['depth']['delta'] * 1000.
-    duration = config.get('duration', 300.0)
+
+    # Calculate optimal duration if 'auto'
+    duration_config = config.get('duration', 'auto')
+    if duration_config == 'auto':
+        duration = calculate_optimal_duration(
+            config['distance']['max'],
+            config['depth']['max']
+        )
+        print(f"📊 Auto-calculated duration: {duration}s (based on {config['distance']['max']} km max distance)")
+    else:
+        duration = float(duration_config)
+
+    time_start = config.get('time_start', -50.0)
 
     # Calculate statistics
     n_dist = int((dist_max - dist_min) / dist_delta) + 1
@@ -410,17 +532,28 @@ def create_gf_store_from_config(config, base_dir='gf_stores'):
     # Create QSEIS configuration
     qsconf = qseis.QSeisConfig()
     qsconf.qseis_version = '2006b'  # Using 2006b (most commonly available)
-    qsconf.time_region = (gf.Timing('0'), gf.Timing(f'{duration}'))
-    qsconf.cut = (gf.Timing('0'), gf.Timing(f'{duration}'))
+
+    # Time region: allow pre-event time for stability
+    qsconf.time_region = (gf.Timing(f'{time_start}'), gf.Timing(f'{duration}'))
+    qsconf.cut = (gf.Timing(f'{time_start}'), gf.Timing(f'{duration}'))
     qsconf.wavelet_duration_samples = 0.001
 
     # Apply QSEIS-specific settings
     qseis_config = config.get('qseis', {})
-    qsconf.sw_algorithm = qseis_config.get('sw_algorithm', 1)
+    qsconf.sw_algorithm = qseis_config.get('sw_algorithm', 0)  # 0 = full wavefield
     qsconf.sw_flat_earth_transform = qseis_config.get('sw_flat_earth_transform', 1)
 
-    slowness = qseis_config.get('slowness_window', [0.0, 0.0, 0.5, 1.5])
+    # Slowness window: [0,0,0,0] = full spectrum (recommended)
+    slowness = qseis_config.get('slowness_window', [0.0, 0.0, 0.0, 0.0])
     qsconf.slowness_window = tuple(slowness)
+
+    # Wavenumber integration parameters
+    qsconf.wavenumber_sampling = qseis_config.get('sample_rate', 8.0)
+    qsconf.aliasing_suppression_factor = qseis_config.get('supp_factor', 0.05)
+
+    print(f"Time window: {time_start}s to {duration}s (total: {duration - time_start}s)")
+    print(f"QSEIS algorithm: {qsconf.sw_algorithm} (0=full wavefield)")
+    print(f"Slowness window: {qsconf.slowness_window}")
 
     # Create store configuration
     modelling_code = config.get('modelling_code', 'qseis.2006b')
@@ -478,10 +611,28 @@ def main():
     parser.add_argument('--store-name', help='Name for the GF store')
     parser.add_argument('--sample-rate', type=float, default=8.0,
                        help='Sampling rate in Hz')
+
+    # Distance parameters
+    parser.add_argument('--distance-min', type=float, default=10.0,
+                       help='Minimum distance in km (default: 10.0)')
     parser.add_argument('--distance-max', type=float, default=1000.0,
-                       help='Maximum distance in km')
+                       help='Maximum distance in km (default: 1000.0)')
+    parser.add_argument('--distance-delta', type=float, default=10.0,
+                       help='Distance increment in km (default: 10.0)')
+
+    # Depth parameters
+    parser.add_argument('--depth-min', type=float, default=1.0,
+                       help='Minimum depth in km (default: 1.0)')
     parser.add_argument('--depth-max', type=float, default=50.0,
-                       help='Maximum depth in km')
+                       help='Maximum depth in km (default: 50.0)')
+    parser.add_argument('--depth-delta', type=float, default=1.0,
+                       help='Depth increment in km (default: 1.0)')
+
+    # Additional parameters
+    parser.add_argument('--nworkers', type=int, default=None,
+                       help='Number of parallel workers for building (passed to fomosto build)')
+    parser.add_argument('--duration', default='auto',
+                       help='Time window duration in seconds, or "auto" for automatic calculation')
 
     args = parser.parse_args()
 
@@ -498,19 +649,56 @@ def main():
     else:
         # Create config from command line arguments
         store_name = args.store_name or f"custom_{int(args.sample_rate)}hz"
+
+        # Handle duration parameter
+        if args.duration == 'auto':
+            duration = 'auto'
+        else:
+            try:
+                duration = float(args.duration)
+            except ValueError:
+                print(f"Error: Invalid duration '{args.duration}'. Use a number or 'auto'")
+                return 1
+
         config = {
             'store_name': store_name,
             'earth_model': args.model,
             'sample_rate': args.sample_rate,
-            'distance': {'min': 10.0, 'max': args.distance_max, 'delta': 10.0},
-            'depth': {'min': 1.0, 'max': args.depth_max, 'delta': 1.0},
-            'duration': 300.0,
+            'distance': {
+                'min': args.distance_min,
+                'max': args.distance_max,
+                'delta': args.distance_delta
+            },
+            'depth': {
+                'min': args.depth_min,
+                'max': args.depth_max,
+                'delta': args.depth_delta
+            },
+            'duration': duration,
+            'time_start': -50.0,
+            'qseis': {
+                'sw_algorithm': 0,
+                'sw_flat_earth_transform': 1,
+                'slowness_window': [0.0, 0.0, 0.0, 0.0],
+                'sample_rate': 8.0,
+                'supp_factor': 0.05
+            }
         }
 
     # Create store
     store_path = create_gf_store_from_config(config)
 
-    return 0 if store_path else 1
+    if not store_path:
+        return 1
+
+    # Show build command with nworkers if specified
+    if args.nworkers:
+        print("\n" + "=" * 70)
+        print("To build the Green's Functions, run:")
+        print(f"  cd {store_path} && fomosto build --nworkers={args.nworkers}")
+        print("=" * 70)
+
+    return 0
 
 
 if __name__ == "__main__":
