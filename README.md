@@ -114,14 +114,13 @@ The `.tvel` format is simple ASCII:
 
 1. Copy the converted GF directory to SeisComP:
 ```bash
-cp -r gf_sc3gf1d/australia_8hz* ~/.seiscomp/share/gf/
+cp -r gf_sc3gf1d/australia_8hz* ~/.seiscomp/share/gf/ "or your custom GF folder"
 ```
 
-2. Configure in `scmtinv` or moment tensor tools:
+2. Configure in `scmtv` or moment tensor tools:
 ```ini
-# In scmtinv.cfg or global.cfg
-mtinv.greens.model = australia_8hz
-mtinv.greens.path = @DATADIR@/gf/australia_8hz
+# In scmtv.cfg or global.cfg
+Or use scconfig to adjust related configuration
 ```
 
 3. The `.desc` file format:
