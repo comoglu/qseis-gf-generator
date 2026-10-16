@@ -182,12 +182,12 @@ def convert_store_to_sc3gf1d(store_path, output_dir, skip_zeros=False, verbose=F
     # Create description file
     create_description_file(output_path, depths_km, distances_km, config)
 
-    # Component mapping for moment tensor sources
-    # These are the standard sc3gf1d component names
-    component_names = ['ZSS', 'ZDD', 'ZDS', 'RSS', 'RDD', 'RDS', 'TSS', 'TDS']
-
-    if config.ncomponents >= 10:
-        component_names.extend(['ZEP', 'REP'])
+    # Standard sc3gf1d (Jost & Herrmann) components. They are combinations of
+    # the pyrocko 'elastic10' store columns, see standard_components().
+    if config.component_scheme != 'elastic10':
+        raise ValueError(f"component scheme '{config.component_scheme}' is not supported, "
+                         "the store must use 'elastic10'")
+    component_names = list(STANDARD_COMPONENTS)
 
     # Convert each depth/distance pair
     total = len(depths_km) * len(distances_km)
@@ -303,6 +303,81 @@ def create_description_file(output_path, depths, distances, config):
     print(f"Created description file: {desc_file}")
 
 
+# Output component order
+STANDARD_COMPONENTS = ('ZSS', 'ZDS', 'ZDD', 'ZEP', 'RSS', 'RDS', 'RDD', 'REP', 'TSS', 'TDS')
+
+
+def standard_components(g):
+    """
+    Convert the ten pyrocko 'elastic10' store columns to the sc3gf1d
+    (Jost & Herrmann / Minson & Dreger 2008) fundamental components.
+
+    Pyrocko decomposes the moment tensor along the source-receiver azimuth a
+    (n: north, e: east, d: down):
+        f0 = Mnn cos^2 a + Mee sin^2 a + Mne sin 2a      (M_rr)
+        f1 = Mnd cos a + Med sin a                       (M_rz)
+        f2 = Mdd                                         (M_zz)
+        f3 = (Mee - Mnn)/2 sin 2a + Mne cos 2a           (M_rt)
+        f4 = Med cos a - Mnd sin a                       (M_tz)
+        f5 = Mnn sin^2 a + Mee cos^2 a - Mne sin 2a      (M_tt)
+    and stores
+        radial (outward):     u_r = f0 g0 + f1 g1 + f2 g2 + f5 g8
+        transverse (a + 90):  u_t = f3 g3 + f4 g4
+        down:                 u_d = f0 g5 + f1 g6 + f2 g7 + f5 g9
+
+    sc3gf1d expects Z positive up, R positive away from the source and
+    T positive at a + 90 deg, with
+        u_z = Mxx (ZSS/2 cos 2a - ZDD/6 + ZEP/3) + Myy (-ZSS/2 cos 2a - ZDD/6 + ZEP/3)
+              + Mzz (ZDD/3 + ZEP/3) + Mxy ZSS sin 2a + Mxz ZDS cos a + Myz ZDS sin a
+        u_r = same with R*
+        u_t = TSS ((Mxx - Myy)/2 sin 2a - Mxy cos 2a) + TDS (Mxz sin a - Myz cos a)
+
+    g: sequence of ten equally long sample arrays (store columns 0-9).
+    Returns a dict component -> samples.
+    """
+    g = [np.asarray(x, dtype=float) for x in g]
+    return {
+        'ZSS': g[9] - g[5],
+        'ZDS': -g[6],
+        'ZDD': g[5] + g[9] - 2.0 * g[7],
+        'ZEP': -(g[5] + g[7] + g[9]),
+        'RSS': g[0] - g[8],
+        'RDS': g[1],
+        'RDD': 2.0 * g[2] - g[0] - g[8],
+        'REP': g[0] + g[2] + g[8],
+        'TSS': -g[3],
+        'TDS': -g[4],
+    }
+
+
+def store_columns(store, depth_m, distance_m, ncomponents=10):
+    """
+    The store columns of one depth/distance pair on a common time axis.
+    Returns (list of arrays, itmin) or (None, None) if a column is missing.
+    """
+    traces = []
+    for idx in range(ncomponents):
+        tr = store.get((depth_m, distance_m, idx), interpolation='nearest_neighbor')
+        if tr is None:
+            return None, None
+        traces.append(tr)
+    nonempty = [tr for tr in traces if len(tr.data)]
+    if not nonempty:
+        return [np.zeros(1) for _ in traces], 0
+    itmin = min(tr.itmin for tr in nonempty)
+    itmax = max(tr.itmin + len(tr.data) for tr in nonempty)
+    cols = []
+    for tr in traces:
+        # Outside its stored span a GF trace continues with its begin/end value
+        y = np.full(itmax - itmin, float(getattr(tr, 'begin_value', 0.0) or 0.0))
+        if len(tr.data):
+            i0 = tr.itmin - itmin
+            y[i0:i0 + len(tr.data)] = tr.data
+            y[i0 + len(tr.data):] = float(getattr(tr, 'end_value', tr.data[-1]))
+        cols.append(y)
+    return cols, itmin
+
+
 def convert_gf_pair(store, output_path, depth_km, distance_km, component_names,
                    skip_zeros=False, verbose=False):
     """
@@ -346,40 +421,29 @@ def convert_gf_pair(store, output_path, depth_km, distance_km, component_names,
         # Get sampling parameters
         dt = 1.0 / store.config.sample_rate
 
-        # Write each component as SAC file
-        ncomponents = min(len(component_names), store.config.ncomponents)
+        cols, itmin = store_columns(store, depth_m, distance_m, store.config.ncomponents)
+        if cols is None:
+            if verbose:
+                print("    Missing store columns")
+            return 0
+        comps = standard_components(cols)
         traces_written = 0
 
-        for idx in range(ncomponents):
-            comp_name = component_names[idx]
-
-            # Extract GF trace for this component using store.get()
-            # Args: (source_depth, distance, component)
-            gf_trace = store.get((depth_m, distance_m, idx), interpolation='nearest_neighbor')
-
-            if gf_trace is None:
-                if verbose:
-                    print(f"    Component {comp_name}: None (missing)")
-                continue
-
-            if gf_trace.is_zero:
-                if skip_zeros:
-                    if verbose:
-                        print(f"    Component {comp_name}: skipped (zero)")
-                    continue
-                elif verbose:
-                    print(f"    Component {comp_name}: zero trace")
-
-            # Get trace data
-            data = gf_trace.data
+        for comp_name in component_names:
+            data = comps[comp_name].astype(np.float32)
             nsamples = len(data)
+
+            if skip_zeros and not np.any(data):
+                if verbose:
+                    print(f"    Component {comp_name}: skipped (zero)")
+                continue
 
             if verbose:
                 max_amp = np.abs(data).max()
                 print(f"    Component {comp_name}: {nsamples} samples, max amp={max_amp:.2e}")
 
             # Calculate time offset
-            tmin = gf_trace.itmin * dt
+            tmin = itmin * dt
 
             # Convert to ObsPy trace
             obs_tr = Trace(data=data)
@@ -391,7 +455,9 @@ def convert_gf_pair(store, output_path, depth_km, distance_km, component_names,
             # Station/channel info
             obs_tr.stats.station = f"D{int(distance_km):05d}"
             obs_tr.stats.channel = comp_name[:3]
-            obs_tr.stats.network = "SY"
+            # "GF": standard components (older conversions wrote "SY" with
+            # store columns in index order)
+            obs_tr.stats.network = "GF"
             obs_tr.stats.location = ""
 
             # SAC headers
